@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Privacy Policy - ReclassUtility</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            line-height: 1.6;
+            color: #c9d1d9;
+            background-color: #0d1117;
+            max-width: 800px;
+            margin: 40px auto;
+            padding: 20px;
+        }
+
+        h1,
+        h2 {
+            color: #58a6ff;
+        }
+
+        .last-updated {
+            color: #8b949e;
+            font-style: italic;
+            margin-bottom: 30px;
+        }
+
+        section {
+            margin-bottom: 30px;
+            border-bottom: 1px solid #30363d;
+            padding-bottom: 20px;
+        }
+
+        section:last-child {
+            border-bottom: none;
+        }
+
+        a {
+            color: #58a6ff;
+            text-decoration: none;
+        }
+
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Privacy Policy</h1>
+    <p class="last-updated">Last updated: March 9, 2026</p>
+
+    <p>ReclassUtility ("we," "us," or "our") is committed to protecting your privacy. This Privacy Policy explains how
+        we collect, use, disclose, and safeguard your information when you use our application.</p>
+
+    <section>
+        <h2>1. Overview: Local-First Privacy</h2>
+        <p>ReclassUtility is designed with a "local-first" architecture. Most of your data, including synchronized
+            QuickBooks Online transaction data and classification rules, is stored locally on your own machine in a
+            SQLite database and the macOS Keychain.</p>
+    </section>
+
+    <section>
+        <h2>2. Data Collection</h2>
+        <ul>
+            <li><strong>QuickBooks Data:</strong> We fetch transaction data (General Ledger, Transactions, Classes) via
+                official Intuit APIs to enable the application's functionality. This data remains on your local machine.
+            </li>
+            <li><strong>Authentication Data:</strong> OAuth 2.0 Access and Refresh tokens are stored securely in your
+                macOS Keychain. We do not transmit these tokens to any server other than Intuit's official authorization
+                servers.</li>
+            <li><strong>Usage Logs:</strong> The application generates local logs for debugging and auditing purposes
+                (Audit History). These logs are stored locally and are not transmitted to us.</li>
+        </ul>
+    </section>
+
+    <section>
+        <h2>3. Use of Your Data</h2>
+        <p>We use the data fetched from QuickBooks Online solely to:</p>
+        <ul>
+            <li>Display and group transactions for your review.</li>
+            <li>Apply classification rules.</li>
+            <li>Update transaction classes in your QuickBooks Online company via API.</li>
+        </ul>
+    </section>
+
+    <section>
+        <h2>4. Third-Party Services</h2>
+        <p>The Application interacts with QuickBooks Online (Intuit Inc.). Your use of QuickBooks Online is subject to
+            Intuit's own Privacy Policy and Terms of Service. We do not share your data with any other third parties.
+        </p>
+    </section>
+
+    <section>
+        <h2>5. Data Security</h2>
+        <p>We leverage industry-standard security practices, including the use of the macOS Keychain for sensitive
+            credentials and secure HTTPS communication for API requests to Intuit.</p>
+    </section>
+
+    <section>
+        <h2>6. Changes to This Privacy Policy</h2>
+        <p>We may update our Privacy Policy from time to time. We will notify you of any changes by posting the new
+            Privacy Policy on this page.</p>
+    </section>
+
+    <section>
+        <h2>7. Contact Us</h2>
+        <p>If you have any questions or suggestions about our Privacy Policy, do not hesitate to contact us at <a
+                href="mailto:partnerships@biostate.ai">partnerships@biostate.ai</a>.</p>
+    </section>
+</body>
+
+</html>
