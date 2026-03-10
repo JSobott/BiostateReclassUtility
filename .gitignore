@@ -1,0 +1,10 @@
+/target
+/venv
+/.venv
+*.db
+*.log
+*.pid
+*.json
+.DS_Store
+strangelog*
+test_keyring*
