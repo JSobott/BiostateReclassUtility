@@ -45,14 +45,17 @@ async def run_sync_job(
     db: AppDb,
     start_date: str | None = None,
     end_date: str | None = None,
-    progress_callback: Callable[[dict], None] | None = None,
+    progress_callback: Callable[[dict], Any] | None = None,
 ) -> None:
     """Run the full sync pipeline: GL fetch -> entity fetch -> rules -> persist -> LLM."""
 
-    def emit(msg: dict) -> None:
+    async def emit(msg: dict) -> None:
         if progress_callback is not None:
             try:
-                progress_callback(msg)
+                result = progress_callback(msg)
+                # Support both sync and async callbacks
+                if asyncio.iscoroutine(result):
+                    await result
             except Exception as cb_err:
                 logger.warning("progress_callback error: %s", cb_err)
 
@@ -65,7 +68,7 @@ async def run_sync_job(
     end_dt = date.fromisoformat(e_date)
 
     # 1. Get OAuth tokens from Keychain
-    emit({"phase": "auth", "message": "Retrieving OAuth tokens..."})
+    await emit({"phase": "auth", "message": "Retrieving OAuth tokens..."})
     try:
         access_token, refresh_token, realm_id = secrets.get_oauth_data()
     except Exception as e:
@@ -78,7 +81,7 @@ async def run_sync_job(
 
     # 2. Fetch the General Ledger report from QBO in 30-day chunks
     logger.info("Fetching QBO General Ledger for %s to %s", s_date, e_date)
-    emit({"phase": "gl_fetch", "message": f"Fetching GL report {s_date} to {e_date}..."})
+    await emit({"phase": "gl_fetch", "message": f"Fetching GL report {s_date} to {e_date}..."})
 
     chunks: list[tuple[str, str]] = []
     current_start = start_dt
@@ -93,7 +96,7 @@ async def run_sync_job(
 
     for chunk_start, chunk_end in chunks:
         logger.info("  -> Fetching GL chunk: %s to %s", chunk_start, chunk_end)
-        emit({
+        await emit({
             "phase": "gl_fetch",
             "message": f"Fetching GL chunk: {chunk_start} to {chunk_end}",
         })
@@ -104,7 +107,7 @@ async def run_sync_job(
             err_str = str(e)
             if "401" in err_str or "AuthenticationFailed" in err_str or isinstance(e, AuthenticationError):
                 logger.warning("QBO Token expired. Refreshing...")
-                emit({"phase": "gl_fetch", "message": "Token expired, refreshing..."})
+                await emit({"phase": "gl_fetch", "message": "Token expired, refreshing..."})
                 client_id, client_secret = secrets.get_client_credentials()
                 new_tokens = await QboClient.refresh_oauth_token(
                     client_id, client_secret, refresh_token
@@ -123,7 +126,7 @@ async def run_sync_job(
         gl_entries.extend(chunk_entries)
 
     logger.info("Found %d unique classifiable transactions in the GL", len(gl_entries))
-    emit({
+    await emit({
         "phase": "gl_fetch",
         "message": f"Found {len(gl_entries)} unique classifiable transactions",
     })
@@ -156,7 +159,7 @@ async def run_sync_job(
         len(gl_entries),
         QBO_CONCURRENT_FETCHES,
     )
-    emit({
+    await emit({
         "phase": "entity_fetch",
         "message": f"Fetching entity details for {len(gl_entries)} transactions...",
     })
@@ -268,7 +271,7 @@ async def run_sync_job(
             total_attempted,
             cause,
         )
-        emit({
+        await emit({
             "phase": "entity_fetch",
             "message": f"{fetch_failures}/{total_attempted} entity fetches failed.{cause}",
         })
@@ -282,7 +285,7 @@ async def run_sync_job(
         )
 
     logger.info("Extracted %d unclassified lines total.", len(all_lines))
-    emit({
+    await emit({
         "phase": "entity_fetch",
         "message": f"Extracted {len(all_lines)} unclassified lines",
     })
@@ -301,7 +304,7 @@ async def run_sync_job(
         logger.info(
             "%d lines classified by heuristic rules (skipping LLM)", rule_applied_count
         )
-        emit({
+        await emit({
             "phase": "rules",
             "message": f"{rule_applied_count} lines classified by heuristic rules",
         })
@@ -316,7 +319,7 @@ async def run_sync_job(
             )
 
     logger.info("%d lines persisted (Upserted safely).", len(all_lines))
-    emit({
+    await emit({
         "phase": "persist",
         "message": f"{len(all_lines)} lines persisted to database",
     })
@@ -333,7 +336,7 @@ async def run_sync_job(
 
     if to_infer:
         logger.info("Starting concurrent LLM inference for %d items...", len(to_infer))
-        emit({
+        await emit({
             "phase": "llm",
             "message": f"Running LLM inference for {len(to_infer)} items...",
         })
@@ -378,7 +381,7 @@ async def run_sync_job(
 
                 completed_count += 1
                 if completed_count % 10 == 0:
-                    emit({
+                    await emit({
                         "phase": "llm",
                         "message": f"LLM inference: {completed_count}/{len(to_infer)} complete",
                     })
@@ -386,13 +389,13 @@ async def run_sync_job(
         llm_tasks = [asyncio.create_task(infer_line(line)) for line in to_infer]
         await asyncio.gather(*llm_tasks, return_exceptions=True)
 
-        emit({
+        await emit({
             "phase": "llm",
             "message": f"LLM inference complete: {len(to_infer)} items processed",
         })
 
     logger.info("Sync complete.")
-    emit({"phase": "done", "message": "Sync complete"})
+    await emit({"phase": "done", "message": "Sync complete"})
 
 
 # ---------------------------------------------------------------------------

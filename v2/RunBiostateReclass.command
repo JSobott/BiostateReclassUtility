@@ -6,6 +6,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Ensure Node.js and Python 3.12 are on PATH
+export PATH="$HOME/local/node/bin:$HOME/local/python312/bin:$PATH"
+
 echo "========================================="
 echo "  BiostateReclassUtility v2"
 echo "  QBO Classification with Claude Opus 4.6"
@@ -22,7 +25,7 @@ sleep 1
 echo "[2/6] Setting up Python environment..."
 if [ ! -d "backend/.venv" ]; then
     echo "       Creating virtual environment..."
-    python3 -m venv backend/.venv
+    python3.12 -m venv backend/.venv
 fi
 source backend/.venv/bin/activate
 pip install -q -r backend/requirements.txt 2>&1 | tail -1
@@ -38,15 +41,13 @@ cd ..
 echo "[4/6] Setting up frontend..."
 if [ ! -d "frontend/node_modules" ]; then
     echo "       Installing npm dependencies..."
-    cd frontend && npm install --silent && cd ..
+    (cd frontend && npm install --silent)
 fi
 
 # 5. Start Vite dev server
 echo "[5/6] Starting frontend dev server..."
-cd frontend
-npx vite --host 127.0.0.1 --port 5173 &
+(cd frontend && npx vite --host 127.0.0.1 --port 5173) &
 FRONTEND_PID=$!
-cd ..
 
 # 6. Wait for servers and open Chrome
 echo "[6/6] Opening Chrome..."
