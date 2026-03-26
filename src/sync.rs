@@ -118,13 +118,18 @@ pub async fn run_sync_job(
     };
 
     // 2c. Load classification rules from DB
-    let rules = db.get_rules().unwrap_or_else(|_| Vec::new());
+    let rules = db.get_rules().unwrap_or_else(|e| {
+        tracing::warn!("Failed to load classification rules from DB: {}. Proceeding without rules.", e);
+        Vec::new()
+    });
     if !rules.is_empty() {
         tracing::info!("Loaded {} classification rules", rules.len());
     }
 
-    // 4. Fetch the full entity to inspect its Line items concurrently
+    // 4. Fetch the full entity to inspect its Line items concurrently.
+    //    Use an abort flag to detect 401 cascades and stop wasting API calls.
     let qbo_client_arc = Arc::new(qbo_client);
+    let abort_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let concurrent_fetch_limit = 3; // Strict limit to avoid Intuit 429 ThrottleExceeded
 
     tracing::info!(
@@ -136,7 +141,13 @@ pub async fn run_sync_job(
     let fetch_results: Vec<Result<Vec<TransactionLine>, Box<dyn std::error::Error>>> = stream::iter(gl_entries.into_iter())
         .map(|entry| {
             let qbo = Arc::clone(&qbo_client_arc);
+            let abort = Arc::clone(&abort_flag);
             async move {
+                // Check abort flag before starting — if token expired, skip remaining fetches
+                if abort.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(format!("Skipped {} id={}: abort flag set due to earlier auth failure", entry.api_type, entry.tx_id).into());
+                }
+
                 // Add an artificial delay to prevent burst limit triggers per Intuit docs
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -183,7 +194,8 @@ pub async fn run_sync_job(
                     Err(e) => {
                         let err_str = e.to_string();
                         if err_str.contains("401") || err_str.contains("AuthenticationFailed") {
-                            tracing::warn!("Token expired during concurrent fetch for {} id={}. Cannot refresh inside Arc context — remaining fetches will fail.", entry.api_type, entry.tx_id);
+                            tracing::error!("Token expired during concurrent fetch for {} id={}. Setting abort flag to skip remaining fetches.", entry.api_type, entry.tx_id);
+                            abort.store(true, std::sync::atomic::Ordering::Relaxed);
                         } else {
                             tracing::warn!("Failed to fetch {} id={}: {}", entry.api_type, entry.tx_id, e);
                         }
@@ -197,23 +209,36 @@ pub async fn run_sync_job(
 
     let total_attempted = fetch_results.len();
     let mut fetch_failures = 0;
+    let mut auth_aborted = false;
     let unclassified_nested: Vec<Vec<TransactionLine>> = fetch_results
         .into_iter()
         .filter_map(|res| match res {
             Ok(lines) => Some(lines),
-            Err(_) => {
+            Err(e) => {
                 fetch_failures += 1;
+                if e.to_string().contains("abort flag") || e.to_string().contains("AuthenticationFailed") {
+                    auth_aborted = true;
+                }
                 None
             }
         })
         .collect();
 
     if fetch_failures > 0 {
-        tracing::warn!(
-            "⚠️  {}/{} entity fetches failed and were dropped. These transactions will NOT appear in the review UI.",
+        tracing::error!(
+            "{}/{} entity fetches failed. These transactions will NOT appear in the review UI.{}",
             fetch_failures,
-            total_attempted
+            total_attempted,
+            if auth_aborted { " CAUSE: OAuth token expired mid-sync. Re-run sync after refreshing tokens." } else { "" }
         );
+    }
+
+    // If auth failure caused a cascade, return an error so the user knows the sync was incomplete
+    if auth_aborted && fetch_failures > total_attempted / 2 {
+        return Err(format!(
+            "Sync aborted: OAuth token expired mid-sync. {}/{} entity fetches failed. Please refresh your token and re-run the sync.",
+            fetch_failures, total_attempted
+        ).into());
     }
 
     let mut unclassified_lines: Vec<TransactionLine> =

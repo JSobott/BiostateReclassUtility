@@ -282,7 +282,11 @@ async fn writeback_progress_sse(
 
     let stream = async_stream::stream! {
         while let Ok(msg) = rx.recv().await {
+            let is_done = msg.contains("\"status\":\"done\"") || msg.contains("\"status\":\"error\"");
             yield Ok(Event::default().data(msg));
+            if is_done {
+                break; // Terminate SSE stream after completion/error to free the connection
+            }
         }
     };
 
@@ -350,7 +354,16 @@ async fn perform_writeback(
         );
 
         // We need the QBO class list to map names to QBO IDs
-        let active_classes = qbo_client.fetch_active_classes().await.unwrap_or_default();
+        let active_classes = match qbo_client.fetch_active_classes().await {
+            Ok(classes) => classes,
+            Err(e) => {
+                tracing::error!("Failed to fetch QBO class list for writeback: {}. Aborting batch.", e);
+                let _ = state.progress_tx.send(
+                    serde_json::json!({"status": "error", "message": format!("Failed to fetch QBO class list: {}", e)}).to_string(),
+                );
+                return;
+            }
+        };
         let class_name_to_id: std::collections::HashMap<String, String> = active_classes
             .into_iter()
             .map(|(id, name)| (name, id))
@@ -373,11 +386,13 @@ async fn perform_writeback(
                         .and_then(|l| l.entity_name.clone())
                         .unwrap_or_else(|| "Unknown Entity".to_string());
                     for line in &lines {
-                        let _ = state.db.update_status(
+                        if let Err(e) = state.db.update_status(
                             &line.tx_id,
                             &line.line_id,
                             TransactionStatus::Failed,
-                        );
+                        ) {
+                            tracing::error!("Failed to update status to Failed for {}:{}: {}", line.tx_id, line.line_id, e);
+                        }
                     }
                     let _ = state.progress_tx.send(serde_json::json!({"status": "progress", "success": false, "entity_name": entity_name, "error": err_msg }).to_string());
                     skipped_or_failed += 1;
@@ -443,11 +458,13 @@ async fn perform_writeback(
                     .and_then(|l| l.entity_name.clone())
                     .unwrap_or_else(|| "Unknown Entity".to_string());
                 for line in &lines {
-                    let _ = state.db.update_status(
+                    if let Err(e) = state.db.update_status(
                         &line.tx_id,
                         &line.line_id,
                         TransactionStatus::Failed,
-                    );
+                    ) {
+                        tracing::error!("Failed to update status to Failed for {}:{}: {}", line.tx_id, line.line_id, e);
+                    }
                 }
                 let _ = state.progress_tx.send(serde_json::json!({"status": "progress", "success": false, "entity_name": entity_name, "error": err_msg }).to_string());
                 skipped_or_failed += 1;
@@ -457,10 +474,25 @@ async fn perform_writeback(
             }
 
             // Construct payload metadata
-            entity
-                .as_object_mut()
-                .unwrap()
-                .insert("sparse".to_string(), serde_json::json!(true));
+            let entity_obj = match entity.as_object_mut() {
+                Some(obj) => obj,
+                None => {
+                    let err_msg = "QBO returned non-object entity JSON — cannot construct sparse update";
+                    tracing::error!("Writeback aborted for {}: {}", tx_id, err_msg);
+                    let entity_name = lines.first().and_then(|l| l.entity_name.clone()).unwrap_or_else(|| "Unknown Entity".to_string());
+                    for line in &lines {
+                        if let Err(e) = state.db.update_status(&line.tx_id, &line.line_id, TransactionStatus::Failed) {
+                            tracing::error!("Failed to update status to Failed for {}:{}: {}", line.tx_id, line.line_id, e);
+                        }
+                    }
+                    let _ = state.progress_tx.send(serde_json::json!({"status": "progress", "success": false, "entity_name": entity_name, "error": err_msg }).to_string());
+                    skipped_or_failed += 1;
+                    processed += 1;
+                    let _ = state.progress_tx.send(serde_json::json!({"status": "progress", "processed": processed, "total": total_groups, "success": success, "failed": skipped_or_failed }).to_string());
+                    continue;
+                }
+            };
+            entity_obj.insert("sparse".to_string(), serde_json::json!(true));
             let request_id = uuid::Uuid::new_v4().to_string();
 
             // 3. Dry-Run Check vs Actual API Call
@@ -469,7 +501,7 @@ async fn perform_writeback(
                 let mut validation_errors = Vec::new();
 
                 // Validate QBO minimum sparse update requirements
-                let entity_obj = entity.as_object().unwrap();
+                let entity_obj = entity.as_object().expect("entity confirmed as object above");
                 if !entity_obj.contains_key("Id") {
                     is_valid = false;
                     validation_errors.push("Missing 'Id' field");
@@ -513,12 +545,14 @@ async fn perform_writeback(
                         tx_id
                     );
                     let req_str = serde_json::to_string(&entity).unwrap_or_default();
-                    let _ = state.db.log_writeback_audit(
+                    if let Err(e) = state.db.log_writeback_audit(
                         "batch-dry-run",
                         &req_str,
                         "{\"message\":\"Locally validated successfully against QBO sparse update schema\"}",
                         "DRY_RUN"
-                    );
+                    ) {
+                        tracing::error!("Failed to log DRY_RUN audit for {}: {}", tx_id, e);
+                    }
 
                     // Mark as validated locally
                     let entity_name = lines
@@ -526,11 +560,13 @@ async fn perform_writeback(
                         .and_then(|l| l.entity_name.clone())
                         .unwrap_or_else(|| "Unknown Entity".to_string());
                     for approved in &lines {
-                        let _ = state.db.update_status(
+                        if let Err(e) = state.db.update_status(
                             &approved.tx_id,
                             &approved.line_id,
                             TransactionStatus::Validated,
-                        );
+                        ) {
+                            tracing::error!("Failed to update status to Validated for {}:{}: {}", approved.tx_id, approved.line_id, e);
+                        }
                     }
                     let _ = state.progress_tx.send(serde_json::json!({"status": "progress", "success": true, "entity_name": entity_name }).to_string());
 
@@ -542,12 +578,14 @@ async fn perform_writeback(
                         validation_errors
                     );
                     let err_msg = format!("Validation failed: {}", validation_errors.join(", "));
-                    let _ = state.db.log_writeback_audit(
+                    if let Err(e) = state.db.log_writeback_audit(
                         "batch-dry-run",
                         &serde_json::to_string(&entity).unwrap_or_default(),
                         &serde_json::json!({"error": err_msg}).to_string(),
                         "FAILED",
-                    );
+                    ) {
+                        tracing::error!("Failed to log FAILED audit for {}: {}", tx_id, e);
+                    }
 
                     // Mark as failed locally
                     let entity_name = lines
@@ -555,11 +593,13 @@ async fn perform_writeback(
                         .and_then(|l| l.entity_name.clone())
                         .unwrap_or_else(|| "Unknown Entity".to_string());
                     for approved in &lines {
-                        let _ = state.db.update_status(
+                        if let Err(e) = state.db.update_status(
                             &approved.tx_id,
                             &approved.line_id,
                             TransactionStatus::Failed,
-                        );
+                        ) {
+                            tracing::error!("Failed to update status to Failed for {}:{}: {}", approved.tx_id, approved.line_id, e);
+                        }
                     }
                     let _ = state.progress_tx.send(serde_json::json!({"status": "progress", "success": false, "entity_name": entity_name, "error": err_msg }).to_string());
 
@@ -574,12 +614,14 @@ async fn perform_writeback(
                         let req_str = serde_json::to_string(&entity).unwrap_or_default();
                         let res_str = serde_json::to_string(&response_value).unwrap_or_default();
 
-                        let _ = state.db.log_writeback_audit(
+                        if let Err(e) = state.db.log_writeback_audit(
                             "batch-interactive",
                             &req_str,
                             &res_str,
                             "SUCCESS",
-                        );
+                        ) {
+                            tracing::error!("Failed to log SUCCESS audit for {}: {}", tx_id, e);
+                        }
 
                         // Mark as posted locally
                         let entity_name = lines
@@ -587,11 +629,13 @@ async fn perform_writeback(
                             .and_then(|l| l.entity_name.clone())
                             .unwrap_or_else(|| "Unknown Entity".to_string());
                         for approved in &lines {
-                            let _ = state.db.update_status(
+                            if let Err(e) = state.db.update_status(
                                 &approved.tx_id,
                                 &approved.line_id,
                                 TransactionStatus::Posted,
-                            );
+                            ) {
+                                tracing::error!("Failed to update status to Posted for {}:{}: {}", approved.tx_id, approved.line_id, e);
+                            }
                         }
                         let _ = state.progress_tx.send(serde_json::json!({"status": "progress", "success": true, "entity_name": entity_name }).to_string());
                         success += 1;
@@ -600,12 +644,14 @@ async fn perform_writeback(
                         tracing::error!("Failed to writeback {}: {}", tx_id, e);
 
                         let req_str = serde_json::to_string(&entity).unwrap_or_default();
-                        let _ = state.db.log_writeback_audit(
+                        if let Err(audit_err) = state.db.log_writeback_audit(
                             "batch-interactive",
                             &req_str,
                             &e.to_string(),
                             "FAILED",
-                        );
+                        ) {
+                            tracing::error!("Failed to log FAILED audit for {}: {}", tx_id, audit_err);
+                        }
 
                         // Mark as failed locally
                         let entity_name = lines
@@ -613,11 +659,13 @@ async fn perform_writeback(
                             .and_then(|l| l.entity_name.clone())
                             .unwrap_or_else(|| "Unknown Entity".to_string());
                         for approved in &lines {
-                            let _ = state.db.update_status(
+                            if let Err(db_err) = state.db.update_status(
                                 &approved.tx_id,
                                 &approved.line_id,
                                 TransactionStatus::Failed,
-                            );
+                            ) {
+                                tracing::error!("Failed to update status to Failed for {}:{}: {}", approved.tx_id, approved.line_id, db_err);
+                            }
                         }
                         let _ = state.progress_tx.send(serde_json::json!({"status": "progress", "success": false, "entity_name": entity_name, "error": e.to_string() }).to_string());
 
@@ -782,7 +830,7 @@ async fn get_available_classes() -> impl IntoResponse {
         Ok(classes) => Json(classes).into_response(),
         Err(e) => {
             tracing::error!("Failed to fetch QBO classes: {}", e);
-            Json(Vec::<(String, String)>::new()).into_response()
+            (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": format!("Failed to fetch QBO classes: {}", e)}))).into_response()
         }
     }
 }
@@ -842,9 +890,13 @@ async fn oauth_callback(
         return Redirect::temporary("/?oauth_error=true").into_response();
     }
 
-    // Verify CSRF state parameter
-    let expected_state = app_state.oauth_state.lock().ok().and_then(|g| g.clone());
-    if expected_state.is_some() && params.state != expected_state {
+    // Verify CSRF state parameter — reject if state is missing or mismatched
+    let expected_state = app_state.oauth_state.lock().ok().and_then(|mut g| g.take());
+    if expected_state.is_none() {
+        tracing::error!("OAuth CSRF state not found (server may have restarted). Rejecting callback.");
+        return Redirect::temporary("/?oauth_error=csrf").into_response();
+    }
+    if params.state != expected_state {
         tracing::error!(
             "OAuth CSRF state mismatch. Expected: {:?}, Got: {:?}",
             expected_state,

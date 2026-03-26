@@ -14,6 +14,13 @@ pub struct AppDb {
 pub fn init_db() -> Result<AppDb, Box<dyn std::error::Error>> {
     let conn = Connection::open("reclass_utility.db")?;
 
+    // SQLite hardening: WAL mode for crash safety, busy timeout for concurrent access
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA busy_timeout=5000;
+         PRAGMA foreign_keys=ON;"
+    )?;
+
     conn.execute(
         "CREATE TABLE IF NOT EXISTS transaction_lines (
             tx_id TEXT NOT NULL,
@@ -76,8 +83,12 @@ impl AppDb {
     /// Locks the inner connection, converting a poisoned Mutex into a rusqlite error
     /// instead of panicking the entire server.
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
-        self.conn.lock().map_err(|_e| {
-            rusqlite::Error::QueryReturnedNoRows // Repurposed as a safe fallback
+        self.conn.lock().map_err(|e| {
+            tracing::error!("Database Mutex poisoned — a thread panicked while holding the DB lock: {}", e);
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some("Database Mutex poisoned".to_string()),
+            )
         })
     }
 
@@ -382,18 +393,37 @@ impl AppDb {
         Ok(updated)
     }
 
+    /// Updates the status of a transaction line. Includes a guard to prevent
+    /// invalid backwards transitions (e.g., Posted -> Pending).
     pub fn update_status(
         &self,
         tx_id: &str,
         line_id: &str,
         status: TransactionStatus,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let conn = self.lock_conn()?;
-        conn.execute(
-            "UPDATE transaction_lines SET status = ?1 WHERE tx_id = ?2 AND line_id = ?3",
-            params![status.to_string(), tx_id, line_id],
-        )?;
-        Ok(())
+        // Guard: only allow valid forward transitions.
+        // Pending -> Approved, Approved -> Validated/Failed, Validated -> Posted/Failed, Failed -> Pending (reset)
+        let allowed_from = match status {
+            TransactionStatus::Approved => "'Pending'",
+            TransactionStatus::Validated => "'Approved'",
+            TransactionStatus::Posted => "'Approved', 'Validated'",
+            TransactionStatus::Failed => "'Approved', 'Validated'",
+            TransactionStatus::Rejected => "'Pending'",
+            TransactionStatus::Pending => "'Failed'", // Only allow reset from Failed
+        };
+        let sql = format!(
+            "UPDATE transaction_lines SET status = ?1 WHERE tx_id = ?2 AND line_id = ?3 AND status IN ({})",
+            allowed_from
+        );
+        let count = conn.execute(&sql, params![status.to_string(), tx_id, line_id])?;
+        if count == 0 {
+            tracing::warn!(
+                "Status update to {:?} had no effect for {}:{} — row may not exist or transition is not allowed from current status",
+                status, tx_id, line_id
+            );
+        }
+        Ok(count)
     }
 
     /// Logs a QBO sparse update execution for audit requirements

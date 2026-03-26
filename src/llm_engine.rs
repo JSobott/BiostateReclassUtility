@@ -44,13 +44,22 @@ fn extract_first_json_object(raw: &str) -> Option<&str> {
     None // Unbalanced braces
 }
 
+/// Shared HTTP client for LLM requests — reuses connection pool across predictions.
+static LLM_CLIENT: std::sync::LazyLock<Client> = std::sync::LazyLock::new(|| {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("Failed to build LLM HTTP client")
+});
+
 /// Predict the QBO Class for a transaction line item.
 /// `available_classes` is a list of (id, name) tuples representing the active QBO Classes.
 pub async fn predict_class(
     tx: &TransactionLine,
     available_classes: &[(String, String)],
 ) -> Result<LlmPrediction, Box<dyn std::error::Error>> {
-    let client = Client::new();
+    let client = &*LLM_CLIENT;
 
     // Build the class list for the prompt
     let class_list: String = available_classes
@@ -74,9 +83,11 @@ pub async fn predict_class(
         class_list
     );
 
+    let fmt_opt = |o: &Option<String>| o.as_deref().unwrap_or("N/A").to_string();
+    let fmt_amt = |o: &Option<f64>| o.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "N/A".to_string());
     let user_prompt = format!(
-        "Transaction Type: {}\nEntity Name: {:?}\nHeader Memo: {:?}\nLine Description: {:?}\nAccount: {:?}\nAmount: {:?}",
-        tx.tx_type, tx.entity_name, tx.header_memo, tx.line_description, tx.account, tx.amount
+        "Transaction Type: {}\nEntity Name: {}\nHeader Memo: {}\nLine Description: {}\nAccount: {}\nAmount: {}",
+        tx.tx_type, fmt_opt(&tx.entity_name), fmt_opt(&tx.header_memo), fmt_opt(&tx.line_description), fmt_opt(&tx.account), fmt_amt(&tx.amount)
     );
 
     let payload = json!({
